@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 """The old AMQP result backend, deprecated and replaced by the RPC backend."""
-from __future__ import absolute_import, unicode_literals
-
 import socket
+import time
 from collections import deque
 from operator import itemgetter
 
@@ -10,7 +8,6 @@ from kombu import Consumer, Exchange, Producer, Queue
 
 from celery import states
 from celery.exceptions import TimeoutError
-from celery.five import monotonic, range
 from celery.utils import deprecated
 from celery.utils.log import get_logger
 
@@ -29,7 +26,7 @@ def repair_uuid(s):
     # Historically the dashes in UUIDS are removed from AMQ entity names,
     # but there's no known reason to.  Hopefully we'll be able to fix
     # this in v4.0.
-    return '%s-%s-%s-%s-%s' % (s[:8], s[8:12], s[12:16], s[16:20], s[20:])
+    return '{}-{}-{}-{}-{}'.format(s[:8], s[8:12], s[12:16], s[16:20], s[20:])
 
 
 class NoCacheQueue(Queue):
@@ -65,7 +62,7 @@ class AMQPBackend(BaseBackend):
         deprecated.warn(
             'The AMQP result backend', deprecation='4.0', removal='5.0',
             alternative='Please use RPC backend or a persistent backend.')
-        super(AMQPBackend, self).__init__(app, **kwargs)
+        super().__init__(app, **kwargs)
         conf = self.app.conf
         self._connection = connection
         self.persistent = self.prepare_persistent(persistent)
@@ -113,12 +110,24 @@ class AMQPBackend(BaseBackend):
         routing_key, correlation_id = self.destination_for(task_id, request)
         if not routing_key:
             return
+
+        payload = {'task_id': task_id, 'status': state,
+                   'result': self.encode_result(result, state),
+                   'traceback': traceback,
+                   'children': self.current_task_children(request)}
+        if self.app.conf.find_value_for_key('extended', 'result'):
+            payload['name'] = getattr(request, 'task_name', None)
+            payload['args'] = getattr(request, 'args', None)
+            payload['kwargs'] = getattr(request, 'kwargs', None)
+            payload['worker'] = getattr(request, 'hostname', None)
+            payload['retries'] = getattr(request, 'retries', None)
+            payload['queue'] = request.delivery_info.get('routing_key')\
+                if hasattr(request, 'delivery_info') \
+                and request.delivery_info else None
+
         with self.app.amqp.producer_pool.acquire(block=True) as producer:
             producer.publish(
-                {'task_id': task_id, 'status': state,
-                 'result': self.encode_result(result, state),
-                 'traceback': traceback,
-                 'children': self.current_task_children(request)},
+                payload,
                 exchange=self.exchange,
                 routing_key=routing_key,
                 correlation_id=correlation_id,
@@ -127,7 +136,6 @@ class AMQPBackend(BaseBackend):
                 declare=self.on_reply_declare(task_id),
                 delivery_mode=self.delivery_mode,
             )
-        return result
 
     def on_reply_declare(self, task_id):
         return [self._create_binding(task_id)]
@@ -141,12 +149,11 @@ class AMQPBackend(BaseBackend):
         if cache and cached_meta and \
                 cached_meta['status'] in READY_STATES:
             return cached_meta
-        else:
-            try:
-                return self.consume(task_id, timeout=timeout, no_ack=no_ack,
-                                    on_interval=on_interval)
-            except socket.timeout:
-                raise TimeoutError('The operation timed out.')
+        try:
+            return self.consume(task_id, timeout=timeout, no_ack=no_ack,
+                                on_interval=on_interval)
+        except socket.timeout:
+            raise TimeoutError('The operation timed out.')
 
     def get_task_meta(self, task_id, backlog_limit=1000):
         # Polling and using basic_get
@@ -186,7 +193,7 @@ class AMQPBackend(BaseBackend):
     poll = get_task_meta  # XXX compat
 
     def drain_events(self, connection, consumer,
-                     timeout=None, on_interval=None, now=monotonic, wait=None):
+                     timeout=None, on_interval=None, now=time.monotonic, wait=None):
         wait = wait or connection.drain_events
         results = {}
 
@@ -230,7 +237,7 @@ class AMQPBackend(BaseBackend):
 
     def get_many(self, task_ids, timeout=None, no_ack=True,
                  on_message=None, on_interval=None,
-                 now=monotonic, getfields=itemgetter('status', 'task_id'),
+                 now=time.monotonic, getfields=itemgetter('status', 'task_id'),
                  READY_STATES=states.READY_STATES,
                  PROPAGATE_STATES=states.PROPAGATE_STATES, **kwargs):
         with self.app.pool.acquire_channel(block=True) as (conn, channel):
@@ -298,7 +305,8 @@ class AMQPBackend(BaseBackend):
         raise NotImplementedError(
             'delete_group is not supported by this backend.')
 
-    def __reduce__(self, args=(), kwargs={}):
+    def __reduce__(self, args=(), kwargs=None):
+        kwargs = kwargs if kwargs else {}
         kwargs.update(
             connection=self._connection,
             exchange=self.exchange.name,
@@ -308,7 +316,7 @@ class AMQPBackend(BaseBackend):
             auto_delete=self.auto_delete,
             expires=self.expires,
         )
-        return super(AMQPBackend, self).__reduce__(args, kwargs)
+        return super().__reduce__(args, kwargs)
 
     def as_uri(self, include_password=True):
         return 'amqp://'

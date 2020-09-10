@@ -1,17 +1,14 @@
-# -*- coding: utf-8 -*-
-from __future__ import absolute_import, unicode_literals
-
 import numbers
 import os
 import signal
 import socket
 import sys
 from datetime import datetime, timedelta
-from time import time
+from time import monotonic, time
+from unittest.mock import Mock, patch
 
 import pytest
 from billiard.einfo import ExceptionInfo
-from case import Mock, patch
 from kombu.utils.encoding import (default_encode, from_utf8, safe_repr,
                                   safe_str)
 from kombu.utils.uuid import uuid
@@ -20,9 +17,9 @@ from celery import states
 from celery.app.trace import (TraceInfo, _trace_task_ret, build_tracer,
                               mro_lookup, reset_worker_optimizations,
                               setup_worker_optimizations, trace_task)
+from celery.backends.base import BaseDictBackend
 from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry,
                                TaskRevokedError, Terminated, WorkerLostError)
-from celery.five import monotonic
 from celery.signals import task_revoked
 from celery.worker import request as module
 from celery.worker import strategy
@@ -68,7 +65,7 @@ class test_mro_lookup:
 
     def test_order(self):
 
-        class A(object):
+        class A:
             pass
 
         class B(A):
@@ -224,6 +221,34 @@ class test_Request(RequestCase):
         assert self.get_request(
             self.add.s(2, 2).set(shadow='fooxyz')).name == 'fooxyz'
 
+    def test_args(self):
+        args = (2, 2)
+        assert self.get_request(
+            self.add.s(*args)).args == args
+
+    def test_kwargs(self):
+        kwargs = {'1': '2', '3': '4'}
+        assert self.get_request(
+            self.add.s(**kwargs)).kwargs == kwargs
+
+    def test_info_function(self):
+        import random
+        import string
+        kwargs = {}
+        for i in range(0, 2):
+            kwargs[str(i)] = ''.join(random.choice(string.ascii_lowercase) for i in range(1000))
+        assert self.get_request(
+            self.add.s(**kwargs)).info(safe=True).get('kwargs') == kwargs
+        assert self.get_request(
+            self.add.s(**kwargs)).info(safe=False).get('kwargs') == kwargs
+        args = []
+        for i in range(0, 2):
+            args.append(''.join(random.choice(string.ascii_lowercase) for i in range(1000)))
+        assert list(self.get_request(
+            self.add.s(*args)).info(safe=True).get('args')) == args
+        assert list(self.get_request(
+            self.add.s(*args)).info(safe=False).get('args')) == args
+
     def test_no_shadow_header(self):
         request = self.get_request(self.add.s(2, 2),
                                    exclude_headers=['shadow'])
@@ -319,7 +344,7 @@ class test_Request(RequestCase):
         einfo = None
         try:
             raise WorkerLostError()
-        except:
+        except WorkerLostError:
             einfo = ExceptionInfo(internal=True)
         req = self.get_request(self.add.s(2, 2))
         req.task.acks_late = True
@@ -333,7 +358,7 @@ class test_Request(RequestCase):
         einfo = None
         try:
             raise WorkerLostError()
-        except:
+        except WorkerLostError:
             einfo = ExceptionInfo(internal=True)
         req = self.get_request(self.add.s(2, 2))
         req.task.acks_late = True
@@ -378,7 +403,7 @@ class test_Request(RequestCase):
         job.eventer = Mock(name='.eventer')
         try:
             raise Retry('foo', KeyError('moofoobar'))
-        except:
+        except Retry:
             einfo = ExceptionInfo()
             job.on_failure(einfo)
             job.eventer.send.assert_called_with(
@@ -607,6 +632,26 @@ class test_Request(RequestCase):
         job.on_failure(exc_info)
         assert self.mytask.backend.get_status(job.id) == states.PENDING
 
+    def test_on_failure_acks_late_reject_on_worker_lost_enabled(self):
+        try:
+            raise WorkerLostError()
+        except WorkerLostError:
+            exc_info = ExceptionInfo()
+        self.mytask.acks_late = True
+        self.mytask.reject_on_worker_lost = True
+
+        job = self.xRequest()
+        job.delivery_info['redelivered'] = False
+        job.on_failure(exc_info)
+
+        assert self.mytask.backend.get_status(job.id) == states.PENDING
+
+        job = self.xRequest()
+        job.delivery_info['redelivered'] = True
+        job.on_failure(exc_info)
+
+        assert self.mytask.backend.get_status(job.id) == states.PENDING
+
     def test_on_failure_acks_late(self):
         job = self.xRequest()
         job.time_start = 1
@@ -616,9 +661,37 @@ class test_Request(RequestCase):
         except KeyError:
             exc_info = ExceptionInfo()
             job.on_failure(exc_info)
-            assert job.acknowledged
+        assert job.acknowledged
 
-    def test_on_failure_acks_on_failure_or_timeout(self):
+    def test_on_failure_acks_on_failure_or_timeout_disabled_for_task(self):
+        job = self.xRequest()
+        job.time_start = 1
+        job._on_reject = Mock()
+        self.mytask.acks_late = True
+        self.mytask.acks_on_failure_or_timeout = False
+        try:
+            raise KeyError('foo')
+        except KeyError:
+            exc_info = ExceptionInfo()
+            job.on_failure(exc_info)
+
+        assert job.acknowledged is True
+        job._on_reject.assert_called_with(req_logger, job.connection_errors, False)
+
+    def test_on_failure_acks_on_failure_or_timeout_enabled_for_task(self):
+        job = self.xRequest()
+        job.time_start = 1
+        self.mytask.acks_late = True
+        self.mytask.acks_on_failure_or_timeout = True
+        try:
+            raise KeyError('foo')
+        except KeyError:
+            exc_info = ExceptionInfo()
+            job.on_failure(exc_info)
+        assert job.acknowledged is True
+
+    def test_on_failure_acks_on_failure_or_timeout_disabled(self):
+        self.app.conf.acks_on_failure_or_timeout = False
         job = self.xRequest()
         job.time_start = 1
         self.mytask.acks_late = True
@@ -628,7 +701,22 @@ class test_Request(RequestCase):
         except KeyError:
             exc_info = ExceptionInfo()
             job.on_failure(exc_info)
-            assert job.acknowledged is False
+        assert job.acknowledged is True
+        job._on_reject.assert_called_with(req_logger, job.connection_errors,
+                                          False)
+        self.app.conf.acks_on_failure_or_timeout = True
+
+    def test_on_failure_acks_on_failure_or_timeout_enabled(self):
+        self.app.conf.acks_on_failure_or_timeout = True
+        job = self.xRequest()
+        job.time_start = 1
+        self.mytask.acks_late = True
+        try:
+            raise KeyError('foo')
+        except KeyError:
+            exc_info = ExceptionInfo()
+            job.on_failure(exc_info)
+        assert job.acknowledged is True
 
     def test_from_message_invalid_kwargs(self):
         m = self.TaskMessage(self.mytask.name, args=(), kwargs='foo')
@@ -848,6 +936,25 @@ class test_Request(RequestCase):
         assert meta['status'] == states.SUCCESS
         assert meta['result'] == 256
 
+    def test_execute_backend_error_acks_late(self):
+        """direct call to execute should reject task in case of internal failure."""
+        tid = uuid()
+        self.mytask.acks_late = True
+        job = self.xRequest(id=tid, args=[4], kwargs={})
+        job._on_reject = Mock()
+        job._on_ack = Mock()
+        self.mytask.backend = BaseDictBackend(app=self.app)
+        self.mytask.backend.mark_as_done = Mock()
+        self.mytask.backend.mark_as_done.side_effect = Exception()
+        self.mytask.backend.mark_as_failure = Mock()
+        self.mytask.backend.mark_as_failure.side_effect = Exception()
+
+        job.execute()
+
+        assert job.acknowledged
+        job._on_reject.assert_called_once()
+        job._on_ack.assert_not_called()
+
     def test_execute_success_no_kwargs(self):
 
         @self.app.task  # traverses coverage for decorator without parens
@@ -955,6 +1062,11 @@ class test_Request(RequestCase):
         gid = uuid()
         job = self.xRequest(id=uuid(), group=gid)
         assert job.group == gid
+
+    def test_group_index(self):
+        group_index = 42
+        job = self.xRequest(id=uuid(), group_index=group_index)
+        assert job.group_index == group_index
 
 
 class test_create_request_class(RequestCase):

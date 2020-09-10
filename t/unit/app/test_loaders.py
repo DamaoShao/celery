@@ -1,15 +1,13 @@
-from __future__ import absolute_import, unicode_literals
-
 import os
 import sys
 import warnings
+from unittest.mock import Mock, patch
 
 import pytest
-from case import Mock, mock, patch
+from case import mock
 
 from celery import loaders
 from celery.exceptions import NotConfigured
-from celery.five import bytes_if_py2
 from celery.loaders import base, default
 from celery.loaders.app import AppLoader
 from celery.utils.imports import NotAPackage
@@ -93,10 +91,11 @@ class test_LoaderBase:
         def trigger_exception(**kwargs):
             raise ImportError('Dummy ImportError')
         from celery.signals import import_modules
-        import_modules.connect(trigger_exception)
+        x = import_modules.connect(trigger_exception)
         self.app.conf.imports = ('os', 'sys')
         with pytest.raises(ImportError):
             self.loader.import_default_modules()
+        import_modules.disconnect(x)
 
     def test_import_from_cwd_custom_imp(self):
         imp = Mock(name='imp')
@@ -142,7 +141,7 @@ class test_DefaultLoader:
             pass
 
         configname = os.environ.get('CELERY_CONFIG_MODULE') or 'celeryconfig'
-        celeryconfig = ConfigModule(bytes_if_py2(configname))
+        celeryconfig = ConfigModule(configname)
         celeryconfig.imports = ('os', 'sys')
 
         prevconfig = sys.modules.get(configname)
